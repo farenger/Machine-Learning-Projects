@@ -1,0 +1,191 @@
+# ----- Imports and Setup -----
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Sklearn for classic ML approach:
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import classification_report
+
+# PyTorch and Hugging Face transformers for BERT fine-tuning:
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertForSequenceClassification, AdamW, get_linear_schedule_with_warmup
+
+# Set a random seed for reproducibility
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+
+# ----- Data Loading and Preprocessing -----
+# Assumes a CSV file with 'text' and 'labels' columns.
+data_path = 'data.csv'  # Adjust path as needed.
+df = pd.read_csv(data_path)
+
+# Basic text cleaning function using regex.
+def preprocess_text(text):
+    text = text.lower()                             # Lowercase
+    text = re.sub(r'[^a-z\s]', '', text)             # Remove non-alphabetic characters
+    text = re.sub(r'\s+', ' ', text).strip()         # Remove extra spaces/newlines
+    return text
+
+# Create a clean text column.
+df['clean_text'] = df['text'].apply(preprocess_text)
+
+# Convert the string labels (comma separated) into lists.
+df['labels_list'] = df['labels'].apply(lambda x: [label.strip() for label in x.split(',')])
+
+# Use MultiLabelBinarizer to convert lists of labels to a binary matrix.
+mlb = MultiLabelBinarizer()
+y = mlb.fit_transform(df['labels_list'])
+print("Labels:", mlb.classes_)
+
+# ----- Visualization of Class Distribution -----
+# Get label frequencies.
+label_counts = pd.DataFrame(y, columns=mlb.classes_).sum().reset_index()
+label_counts.columns = ['label', 'count']
+
+plt.figure(figsize=(10, 6))
+sns.barplot(x='label', y='count', data=label_counts, palette='viridis')
+plt.title('Label Distribution')
+plt.xlabel('Labels')
+plt.ylabel('Frequency')
+plt.show()
+
+# ----- TF-IDF + Logistic Regression Pipeline -----
+# Split data for the TF-IDF approach.
+X_train, X_test, y_train, y_test = train_test_split(
+    df['clean_text'], y, test_size=0.2, random_state=RANDOM_SEED
+)
+
+# Build a pipeline with TF-IDF and OneVsRest logistic regression.
+pipeline_tfidf = Pipeline([
+    ('tfidf', TfidfVectorizer(max_df=0.9, min_df=5)),
+    ('clf', OneVsRestClassifier(LogisticRegression(max_iter=1000)))
+])
+
+# Train the TF-IDF model.
+pipeline_tfidf.fit(X_train, y_train)
+
+# Evaluate the TF-IDF model.
+y_pred_tfidf = pipeline_tfidf.predict(X_test)
+print("TF-IDF + Logistic Regression Classification Report:")
+print(classification_report(y_test, y_pred_tfidf, target_names=mlb.classes_))
+
+# ----- BERT Fine-Tuning for Multi-label Classification -----
+# Create a custom Dataset class.
+class DocumentDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len=128):
+        self.texts = texts.reset_index(drop=True)
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = str(self.texts.iloc[idx])
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_token_type_ids=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+        # Squeeze to remove extra dimensions.
+        item = {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'labels': torch.tensor(self.labels[idx], dtype=torch.float)
+        }
+        return item
+
+# Load the pre-trained BERT tokenizer and model.
+MODEL_NAME = 'bert-base-uncased'
+tokenizer = BertTokenizer.from_pretrained(MODEL_NAME)
+model = BertForSequenceClassification.from_pretrained(
+    MODEL_NAME, 
+    num_labels=len(mlb.classes_),
+    problem_type="multi_label_classification"
+)
+
+# Split data for BERT.
+train_df, test_df, y_train_full, y_test_full = train_test_split(
+    df[['clean_text']], y, test_size=0.2, random_state=RANDOM_SEED
+)
+
+# Create PyTorch datasets.
+train_dataset = DocumentDataset(train_df['clean_text'], y_train_full, tokenizer, max_len=128)
+test_dataset = DocumentDataset(test_df['clean_text'], y_test_full, tokenizer, max_len=128)
+
+# Training configuration.
+EPOCHS = 3
+BATCH_SIZE = 8
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+total_steps = len(train_loader) * EPOCHS
+
+optimizer = AdamW(model.parameters(), lr=2e-5, correct_bias=False)
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+loss_fn = torch.nn.BCEWithLogitsLoss()
+
+# Training loop function.
+def train_epoch(model, data_loader, loss_fn, optimizer, scheduler, device):
+    model.train()
+    losses = []
+    
+    for batch in data_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+        
+        model.zero_grad()
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+        losses.append(loss.item())
+        
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+    
+    return np.mean(losses)
+
+# Train the BERT model.
+print("Training BERT model for multi-label classification...")
+for epoch in range(EPOCHS):
+    train_loss = train_epoch(model, train_loader, loss_fn, optimizer, scheduler, device)
+    print(f'Epoch {epoch+1}/{EPOCHS}, Loss: {train_loss:.4f}')
+
+# ----- Evaluation of BERT Model -----
+model.eval()
+all_preds = []
+
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+with torch.no_grad():
+    for batch in test_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+        preds = torch.sigmoid(logits).cpu().numpy()  # Apply sigmoid to get probabilities.
+        all_preds.append(preds)
+
+all_preds = np.vstack(all_preds)
+# Binarize predictions (using threshold 0.5, adjust as needed).
+y_pred_bert = (all_preds >= 0.5).astype(int)
+
+print("BERT Multi-label Classification Report:")
+print(classification_report(y_test_full, y_pred_bert, target_names=mlb.classes_))
