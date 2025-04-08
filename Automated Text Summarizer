@@ -1,0 +1,130 @@
+import streamlit as st
+from transformers import pipeline
+import nltk
+import spacy
+import heapq
+from collections import defaultdict
+
+# Download required NLTK data (e.g., punkt tokenizer)
+nltk.download('punkt')
+from nltk.tokenize import sent_tokenize
+
+# Load spaCy English model (make sure to run: python -m spacy download en_core_web_sm)
+nlp = spacy.load('en_core_web_sm')
+
+############################
+# Extractive Summarization #
+############################
+
+def extractive_summarize(text, num_sentences=3):
+    """
+    A simple extractive summarization based on word frequency.
+    1. Tokenizes text and computes frequency of each word excluding stopwords.
+    2. Scores each sentence by summing normalized frequencies.
+    3. Returns the top 'num_sentences' as the summary.
+    """
+    # Process text with spaCy
+    doc = nlp(text)
+    
+    # Build word frequency dictionary (ignoring stop words and punctuation)
+    word_frequencies = {}
+    for token in doc:
+        if token.text.lower() not in nlp.Defaults.stop_words and token.is_alpha:
+            word_frequencies[token.text.lower()] = word_frequencies.get(token.text.lower(), 0) + 1
+
+    # Normalize the frequencies by dividing by maximum frequency
+    if word_frequencies:
+        max_frequency = max(word_frequencies.values())
+    else:
+        max_frequency = 1  # Avoid division by zero
+    for word in word_frequencies:
+        word_frequencies[word] /= max_frequency
+
+    # Tokenize text into sentences
+    sentences = sent_tokenize(text)
+    
+    # Score sentences based on word frequencies
+    sentence_scores = defaultdict(float)
+    for sentence in sentences:
+        sentence_doc = nlp(sentence)
+        for token in sentence_doc:
+            if token.text.lower() in word_frequencies:
+                sentence_scores[sentence] += word_frequencies[token.text.lower()]
+
+    # Select the highest scored sentences
+    best_sentences = heapq.nlargest(num_sentences, sentence_scores, key=sentence_scores.get)
+    summary = " ".join(best_sentences)
+    return summary
+
+#############################
+# Abstractive Summarization #
+#############################
+
+def load_abstractive_model(model_name='bart'):
+    """
+    Load the summarization pipeline based on the requested model.
+    You can choose 'bart' for facebook/bart-large-cnn or 't5' for t5-base.
+    """
+    if model_name == 'bart':
+        model_id = "facebook/bart-large-cnn"
+    elif model_name == 't5':
+        model_id = "t5-base"
+    else:
+        raise ValueError("Unsupported model name. Choose 'bart' or 't5'.")
+    
+    summarizer = pipeline("summarization", model=model_id, tokenizer=model_id)
+    return summarizer
+
+# Create global pipelines (to avoid reloading them at every inference)
+abstractive_models = {
+    "bart": load_abstractive_model("bart"),
+    "t5": load_abstractive_model("t5")
+}
+
+def abstractive_summarize(text, model_choice='bart', max_length=130, min_length=30):
+    """
+    Use a transformer model to produce an abstractive summary.
+    """
+    summarizer = abstractive_models[model_choice]
+    
+    # Depending on the input length, you may need to chunk your text.
+    # Here we assume the text can be summarized in one call.
+    summary = summarizer(text, max_length=max_length, min_length=min_length, do_sample=False)
+    return summary[0]['summary_text']
+
+######################
+# Streamlit Interface#
+######################
+
+st.title("Automatic Text Summarizer")
+
+st.markdown("""
+This application provides two summarization methods:
+- **Extractive Summarization:** Selects key sentences based on frequency.
+- **Abstractive Summarization:** Uses transformer models (BART and T5) to generate a summary.
+""")
+
+# Text input area for long-form text
+text_input = st.text_area("Enter text to summarize", height=300)
+
+# Choose summarization method from dropdown
+method = st.selectbox("Choose Summarization Method", 
+                        options=["Extractive", "Abstractive (BART)", "Abstractive (T5)"])
+
+if st.button("Summarize"):
+    if text_input.strip() == "":
+        st.error("Please provide text to summarize.")
+    else:
+        with st.spinner("Generating summary..."):
+            if method == "Extractive":
+                # You can adjust the number of sentences to include in your summary
+                summary_result = extractive_summarize(text_input, num_sentences=3)
+            elif method == "Abstractive (BART)":
+                summary_result = abstractive_summarize(text_input, model_choice='bart')
+            elif method == "Abstractive (T5)":
+                summary_result = abstractive_summarize(text_input, model_choice='t5')
+            else:
+                summary_result = "Invalid method selected."
+        
+        st.subheader("Summary")
+        st.write(summary_result)
