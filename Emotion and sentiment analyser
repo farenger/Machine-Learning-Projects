@@ -1,0 +1,133 @@
+import torch
+from transformers import RobertaTokenizer, RobertaForSequenceClassification, AdamW
+from transformers import get_scheduler
+from datasets import load_dataset
+from torch.utils.data import DataLoader
+from sklearn.metrics import classification_report
+import matplotlib.pyplot as plt
+import numpy as np
+import random
+
+# ---- Setup ----
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+RANDOM_SEED = 42
+torch.manual_seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+
+# ---- Load GoEmotions Dataset ----
+dataset = load_dataset("go_emotions")
+labels = dataset['train'].features['labels'].feature.names
+num_labels = len(labels)
+
+# Show label distribution
+label_counts = [0] * num_labels
+for entry in dataset['train']['labels']:
+    for label in entry:
+        label_counts[label] += 1
+
+plt.figure(figsize=(12, 6))
+plt.bar(labels, label_counts)
+plt.xticks(rotation=90)
+plt.title("Emotion Label Distribution (GoEmotions)")
+plt.tight_layout()
+plt.show()
+
+# ---- Tokenizer and Model ----
+model_name = "roberta-base"
+tokenizer = RobertaTokenizer.from_pretrained(model_name)
+
+# Preprocess function
+def tokenize_and_encode(example):
+    encoding = tokenizer(
+        example["text"], 
+        padding="max_length", 
+        truncation=True, 
+        max_length=128
+    )
+    label_vec = [0] * num_labels
+    for lbl in example['labels']:
+        label_vec[lbl] = 1
+    encoding["labels"] = label_vec
+    return encoding
+
+encoded_dataset = dataset.map(tokenize_and_encode, batched=False)
+encoded_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+
+# ---- DataLoaders ----
+train_loader = DataLoader(encoded_dataset["train"], batch_size=16, shuffle=True)
+test_loader = DataLoader(encoded_dataset["test"], batch_size=16)
+
+# ---- Load Pretrained RoBERTa ----
+model = RobertaForSequenceClassification.from_pretrained(
+    model_name,
+    num_labels=num_labels,
+    problem_type="multi_label_classification"
+).to(device)
+
+# ---- Optimizer and Scheduler ----
+optimizer = AdamW(model.parameters(), lr=2e-5)
+num_training_steps = len(train_loader) * 3
+lr_scheduler = get_scheduler(
+    "linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
+)
+
+# ---- Training Loop ----
+def train(model, dataloader):
+    model.train()
+    total_loss = 0
+    for batch in dataloader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        outputs = model(**batch)
+        loss = outputs.loss
+        total_loss += loss.item()
+        loss.backward()
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+    return total_loss / len(dataloader)
+
+print("Fine-tuning RoBERTa on GoEmotions...")
+for epoch in range(3):
+    avg_loss = train(model, train_loader)
+    print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}")
+
+# ---- Evaluation ----
+model.eval()
+all_preds, all_labels = [], []
+
+with torch.no_grad():
+    for batch in test_loader:
+        labels = batch["labels"]
+        batch = {k: v.to(device) for k, v in batch.items()}
+        outputs = model(**batch)
+        preds = torch.sigmoid(outputs.logits).cpu().numpy()
+        all_preds.append(preds)
+        all_labels.append(labels.numpy())
+
+all_preds = np.vstack(all_preds)
+all_labels = np.vstack(all_labels)
+
+# Binarize predictions (threshold 0.5)
+binary_preds = (all_preds >= 0.5).astype(int)
+
+# ---- Classification Report ----
+print("\nMulti-label Emotion Classification Report:\n")
+print(classification_report(all_labels, binary_preds, target_names=labels, zero_division=0))
+
+# ---- Visualization: Predicted vs Actual Emotions (Sample) ----
+def show_sample(index):
+    sample = dataset['test'][index]
+    print("Text:\n", sample['text'])
+    print("\nActual Emotions:")
+    print([labels[i] for i in sample['labels']])
+    input_enc = tokenizer(sample['text'], return_tensors="pt", truncation=True, padding=True).to(device)
+    with torch.no_grad():
+        logits = model(**input_enc).logits
+    probs = torch.sigmoid(logits).cpu().numpy()[0]
+    pred_labels = [labels[i] for i, prob in enumerate(probs) if prob >= 0.5]
+    print("\nPredicted Emotions:")
+    print(pred_labels)
+
+# Show example
+show_sample(123)  # Change index to explore other test samples
